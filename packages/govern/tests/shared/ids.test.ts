@@ -5,8 +5,14 @@ describe("tbId", () => {
 	it("returns a bigint", () => {
 		expect(typeof tbId()).toBe("bigint");
 	});
-	it("returns time-ordered values", () => {
+	it("returns unique values", () => {
 		const a = tbId();
+		const b = tbId();
+		expect(b).not.toBe(a);
+	});
+	it("returns time-ordered values across milliseconds", async () => {
+		const a = tbId();
+		await new Promise((r) => setTimeout(r, 2));
 		const b = tbId();
 		expect(b).toBeGreaterThan(a);
 	});
