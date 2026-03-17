@@ -1,0 +1,18 @@
+{
+	"name": "govern-monorepo",
+	"private": true,
+	"type": "module",
+	"workspaces": ["packages/*"],
+	"scripts": {
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"typecheck": "tsc -b"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"typescript": "^5.9.0",
+		"vitest": "^4.0.0"
+	}
+}

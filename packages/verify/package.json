@@ -1,0 +1,10 @@
+{
+	"name": "@usertools/verify",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"bin": { "verify": "./dist/bin/verify.js" },
+	"files": ["dist"],
+	"dependencies": {}
+}
