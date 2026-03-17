@@ -9,6 +9,13 @@
  *   - PII detection
  *   - Circuit breaker (per-provider)
  *   - Pattern memory (prompt hashing)
+ *   - Proxy mode (remote governance)
+ *
+ * Failure modes (Spec Section 15):
+ *   15.1 — LLM succeeds, POST fails → settled: false, settlement_ambiguous audit
+ *   15.2 — LLM fails (retryable) → void pending hold, propagate error
+ *   15.3 — Audit write fails after POST → auditDegraded flag, still return response
+ *   15.4 — TigerBeetle unreachable → LedgerUnavailableError, do NOT forward
  *
  * Usage:
  * ```ts
@@ -22,23 +29,24 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createAuditWriter, type AuditWriter } from "./audit/chain.js";
+import { type AuditWriter, createAuditWriter } from "./audit/chain.js";
 import { detectClientKind } from "./detect.js";
 import { estimateCost, estimateInputTokens } from "./ledger/pricing.js";
-import { evaluatePolicy, loadPolicies, type GateRule } from "./policy/gate.js";
-import { detectPII } from "./policy/pii.js";
-import { CircuitBreakerRegistry } from "./resilience/circuit.js";
 import { recordPattern } from "./memory/patterns.js";
+import { type GateRule, evaluatePolicy, loadPolicies } from "./policy/gate.js";
+import { detectPII } from "./policy/pii.js";
+import { type ProxyConnection, connectProxy } from "./proxy.js";
+import { CircuitBreakerRegistry } from "./resilience/circuit.js";
+import { DEFAULT_BUDGET, VAULT_DIR } from "./shared/constants.js";
+import { LedgerUnavailableError, PolicyDeniedError } from "./shared/errors.js";
+import { governId } from "./shared/ids.js";
 import { GovernConfigSchema } from "./shared/types.js";
 import type {
+	GovernConfig,
 	GovernanceReceipt,
 	GovernedResponse,
-	GovernConfig,
 	LLMClientKind,
 } from "./shared/types.js";
-import { governId } from "./shared/ids.js";
-import { VAULT_DIR, DEFAULT_BUDGET } from "./shared/constants.js";
-import { PolicyDeniedError } from "./shared/errors.js";
 
 // ── Public types ──
 
@@ -60,6 +68,28 @@ export interface GovernOpts {
 	dryRun?: boolean;
 	/** Vault directory override (default: cwd). */
 	vaultBase?: string;
+	/**
+	 * Inject a mock/test engine. When set, used instead of TigerBeetle.
+	 * Primarily for testing failure modes.
+	 * @internal
+	 */
+	_engine?: GovernEngine | null;
+	/**
+	 * Inject a mock/test audit writer. When set, used instead of real audit.
+	 * @internal
+	 */
+	_audit?: AuditWriter;
+}
+
+/** Minimal engine interface for two-phase spend lifecycle. */
+export interface GovernEngine {
+	spendPending(params: {
+		transferId: string;
+		amount: number;
+	}): Promise<{ transferId: string }>;
+	postPendingSpend(transferId: string): Promise<void>;
+	voidPendingSpend(transferId: string): Promise<void>;
+	destroy?(): void;
 }
 
 /** The governed client: original client shape + `destroy()`. */
@@ -67,14 +97,10 @@ export type GovernedClient<T> = T & { destroy(): Promise<void> };
 
 // ── govern() ──
 
-export async function govern<T>(
-	client: T,
-	opts?: GovernOpts,
-): Promise<GovernedClient<T>> {
+export async function govern<T>(client: T, opts?: GovernOpts): Promise<GovernedClient<T>> {
 	// 1. Load config
 	const vaultBase = opts?.vaultBase ?? process.cwd();
-	const configPath =
-		opts?.configPath ?? join(vaultBase, VAULT_DIR, "govern.config.json");
+	const configPath = opts?.configPath ?? join(vaultBase, VAULT_DIR, "govern.config.json");
 
 	let config: GovernConfig;
 	if (existsSync(configPath)) {
@@ -93,26 +119,34 @@ export async function govern<T>(
 
 	// 2. Initialise subsystems
 	const vaultPath = vaultBase;
-	const audit = createAuditWriter(vaultPath);
+	const audit: AuditWriter = opts?._audit ?? createAuditWriter(vaultPath);
 
 	const policiesPath = join(vaultPath, config.policies);
-	const policyRules: GateRule[] = existsSync(policiesPath)
-		? loadPolicies(policiesPath)
-		: [];
+	const policyRules: GateRule[] = existsSync(policiesPath) ? loadPolicies(policiesPath) : [];
 
 	const breaker = new CircuitBreakerRegistry({
 		failureThreshold: config.circuitBreaker.failureThreshold,
 		resetTimeoutMs: config.circuitBreaker.resetTimeout,
 	});
 
-	// 3. Detect client kind
+	// 3. Proxy connection (if proxy mode)
+	let proxyConn: ProxyConnection | null = null;
+	if (opts?.proxy) {
+		proxyConn = connectProxy(opts.proxy, opts.key);
+	}
+
+	// 4. Engine (injected for tests, or null in dry-run/proxy modes)
+	const engine: GovernEngine | null = opts?._engine !== undefined ? opts._engine : null;
+
+	// 5. Detect client kind
 	const kind: LLMClientKind = detectClientKind(client);
 
-	// 4. Track state
+	// 6. Track state
 	let destroyed = false;
 	let budgetSpent = 0;
+	let auditDegraded = false;
 
-	// 5. Two-phase intercept
+	// 7. Two-phase intercept
 	async function interceptCall(
 		originalFn: (...args: unknown[]) => unknown,
 		thisArg: unknown,
@@ -131,12 +165,14 @@ export async function govern<T>(
 		cb.allowRequest();
 
 		// b. Policy gate
-		const policyResult = evaluatePolicy(policyRules, { model, tier: config.tier, ...params });
+		const policyResult = evaluatePolicy(policyRules, {
+			model,
+			tier: config.tier,
+			...params,
+		});
 		if (policyResult.decision === "deny") {
 			const reason =
-				policyResult.reasons.length > 0
-					? policyResult.reasons.join("; ")
-					: "Policy denied";
+				policyResult.reasons.length > 0 ? policyResult.reasons.join("; ") : "Policy denied";
 			throw new PolicyDeniedError(reason);
 		}
 
@@ -144,9 +180,7 @@ export async function govern<T>(
 		if (config.pii !== "off") {
 			const piiResult = detectPII(messages);
 			if (piiResult.found && config.pii === "block") {
-				throw new PolicyDeniedError(
-					`PII detected: ${piiResult.types.join(", ")}`,
-				);
+				throw new PolicyDeniedError(`PII detected: ${piiResult.types.join(", ")}`);
 			}
 			// "warn" and "redact" modes: continue (redact is not implemented at SDK level)
 		}
@@ -157,17 +191,30 @@ export async function govern<T>(
 		const maxOutputTokens = (params.max_tokens as number) ?? 4096;
 		const estimatedCost = estimateCost(model, estimatedInputTokens, maxOutputTokens);
 
+		// d2. Failure mode 15.4: TigerBeetle / engine unreachable — PENDING hold
+		if (engine != null && !isDryRun) {
+			try {
+				await engine.spendPending({
+					transferId,
+					amount: estimatedCost,
+				});
+			} catch (holdErr) {
+				// Ledger unreachable — do NOT forward to provider
+				throw new LedgerUnavailableError(
+					holdErr instanceof Error ? holdErr.message : String(holdErr),
+				);
+			}
+		}
+
 		// e. Forward to original SDK
+		let settled = true;
 		try {
-			const response = await (originalFn as Function).apply(thisArg, args);
+			const response = await (originalFn as (...a: unknown[]) => unknown).apply(thisArg, args);
 
 			// f. Compute actual cost from response usage
 			let actualCost = estimatedCost;
 			if (response != null && typeof response === "object" && "usage" in response) {
-				const usage = (response as Record<string, unknown>).usage as Record<
-					string,
-					unknown
-				> | null;
+				const usage = (response as Record<string, unknown>).usage as Record<string, unknown> | null;
 				if (usage != null) {
 					const inputTokens =
 						(usage.input_tokens as number | undefined) ??
@@ -181,29 +228,70 @@ export async function govern<T>(
 				}
 			}
 
-			// Track budget in dry-run mode
+			// Track budget
 			budgetSpent += actualCost;
 
 			// g. Circuit breaker: record success
 			cb.recordSuccess();
 
-			// h. Audit event
+			// g2. Failure mode 15.1: POST fails after LLM success
+			if (engine != null && !isDryRun) {
+				try {
+					await engine.postPendingSpend(transferId);
+				} catch (postErr) {
+					// POST failed — LLM call succeeded but settlement is ambiguous
+					settled = false;
+					await audit
+						.appendEvent({
+							kind: "settlement_ambiguous",
+							actor: "local",
+							data: {
+								model,
+								cost: actualCost,
+								transferId,
+								error: postErr instanceof Error ? postErr.message : String(postErr),
+							},
+						})
+						.catch(() => {
+							// Audit also degraded — nothing more we can do
+							auditDegraded = true;
+						});
+				}
+			}
+
+			// g3. Proxy settlement
+			if (proxyConn != null && !isDryRun) {
+				try {
+					await proxyConn.settle(transferId, actualCost);
+				} catch {
+					settled = false;
+				}
+			}
+
+			// h. Audit event — failure mode 15.3: audit write failure
 			const auditHash = createHash("sha256").update(transferId).digest("hex");
 			await audit
 				.appendEvent({
 					kind: "llm_call",
 					actor: "local",
-					data: { model, cost: actualCost, settled: true, transferId },
+					data: {
+						model,
+						cost: actualCost,
+						settled,
+						transferId,
+					},
 				})
 				.catch(() => {
-					// Audit degraded — do not fail the response
+					// Failure mode 15.3: Audit degraded — do not fail the response
+					auditDegraded = true;
+					process.stderr.write(
+						`[govern] audit degraded: failed to write llm_call event for ${transferId}\n`,
+					);
 				});
 
 			// i. Pattern memory
 			if (config.patterns.enabled) {
-				const promptHash = createHash("sha256")
-					.update(JSON.stringify(messages))
-					.digest("hex");
+				const promptHash = createHash("sha256").update(JSON.stringify(messages)).digest("hex");
 				await recordPattern({
 					promptHash,
 					model,
@@ -212,9 +300,7 @@ export async function govern<T>(
 				}).catch(() => {});
 			}
 
-			const budgetRemaining = isDryRun
-				? config.budget - budgetSpent
-				: config.budget - budgetSpent;
+			const budgetRemaining = config.budget - budgetSpent;
 
 			const governance: GovernanceReceipt = {
 				transferId,
@@ -222,10 +308,8 @@ export async function govern<T>(
 				budgetRemaining,
 				auditHash,
 				chainPath: join(VAULT_DIR, "audit"),
-				receiptUrl: opts?.proxy
-					? `https://verify.usertools.dev/${transferId}`
-					: null,
-				settled: true,
+				receiptUrl: opts?.proxy != null ? `https://verify.usertools.dev/${transferId}` : null,
+				settled,
 				model,
 				provider: kind,
 				timestamp: new Date().toISOString(),
@@ -236,6 +320,24 @@ export async function govern<T>(
 			// j. Circuit breaker: record failure
 			cb.recordFailure();
 
+			// j2. Failure mode 15.2: LLM fails — VOID the pending hold
+			if (engine != null && !isDryRun) {
+				try {
+					await engine.voidPendingSpend(transferId);
+				} catch {
+					// Best-effort void — log and continue
+				}
+			}
+
+			// j3. Proxy void
+			if (proxyConn != null && !isDryRun) {
+				try {
+					await proxyConn.void(transferId);
+				} catch {
+					// Best-effort void
+				}
+			}
+
 			// k. Audit the failure
 			await audit
 				.appendEvent({
@@ -243,13 +345,13 @@ export async function govern<T>(
 					actor: "local",
 					data: { model, error: String(err), transferId },
 				})
-				.catch(() => {});
+				.catch(() => {
+					auditDegraded = true;
+				});
 
 			// l. Pattern memory: record failure
 			if (config.patterns.enabled) {
-				const promptHash = createHash("sha256")
-					.update(JSON.stringify(messages))
-					.digest("hex");
+				const promptHash = createHash("sha256").update(JSON.stringify(messages)).digest("hex");
 				await recordPattern({
 					promptHash,
 					model,
@@ -262,21 +364,31 @@ export async function govern<T>(
 		}
 	}
 
-	// 6. Build Proxy based on client kind
-	function createProxy(): GovernedClient<T> {
+	// 8. Build Proxy based on client kind
+	function createClientProxy(): GovernedClient<T> {
 		const destroyFn = async (): Promise<void> => {
 			if (destroyed) return;
 			destroyed = true;
+
+			// Flush audit writes
 			await audit.flush();
+
+			// Release audit lock
 			audit.release();
+
+			// Destroy engine if connected
+			if (engine != null && typeof engine.destroy === "function") {
+				engine.destroy();
+			}
+
+			// Destroy proxy connection if active
+			if (proxyConn != null) {
+				proxyConn.destroy();
+			}
 		};
 
 		if (kind === "anthropic") {
-			return buildAnthropicProxy(
-				client,
-				interceptCall,
-				destroyFn,
-			);
+			return buildAnthropicProxy(client, interceptCall, destroyFn);
 		}
 		if (kind === "openai") {
 			return buildOpenAIProxy(client, interceptCall, destroyFn);
@@ -285,7 +397,7 @@ export async function govern<T>(
 		return buildGoogleProxy(client, interceptCall, destroyFn);
 	}
 
-	return createProxy();
+	return createClientProxy();
 }
 
 // ── Proxy builders ──
@@ -311,8 +423,7 @@ function buildAnthropicProxy<T>(
 	const messagesProxy = new Proxy(messages, {
 		get(target, prop, receiver) {
 			if (prop === "create") {
-				return (...args: unknown[]) =>
-					intercept(originalCreate, target, args);
+				return (...args: unknown[]) => intercept(originalCreate, target, args);
 			}
 			return Reflect.get(target, prop, receiver);
 		},
@@ -343,8 +454,7 @@ function buildOpenAIProxy<T>(
 	const completionsProxy = new Proxy(completions, {
 		get(target, prop, receiver) {
 			if (prop === "create") {
-				return (...args: unknown[]) =>
-					intercept(originalCreate, target, args);
+				return (...args: unknown[]) => intercept(originalCreate, target, args);
 			}
 			return Reflect.get(target, prop, receiver);
 		},
@@ -375,15 +485,12 @@ function buildGoogleProxy<T>(
 ): GovernedClient<T> {
 	const original = client as Record<string, unknown>;
 	const models = original.models as Record<string, unknown>;
-	const originalGenerate = models.generateContent as (
-		...args: unknown[]
-	) => unknown;
+	const originalGenerate = models.generateContent as (...args: unknown[]) => unknown;
 
 	const modelsProxy = new Proxy(models, {
 		get(target, prop, receiver) {
 			if (prop === "generateContent") {
-				return (...args: unknown[]) =>
-					intercept(originalGenerate, target, args);
+				return (...args: unknown[]) => intercept(originalGenerate, target, args);
 			}
 			return Reflect.get(target, prop, receiver);
 		},
