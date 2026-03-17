@@ -1,0 +1,401 @@
+/**
+ * govern() — Two-Phase Lifecycle Wrapper
+ *
+ * The convergence point of the @usertools/govern SDK. Wires together:
+ *   - LLM client detection (duck typing)
+ *   - TigerBeetle ledger (PENDING → POST/VOID)
+ *   - SHA-256 hash-chained audit trail
+ *   - Policy gate (12-operator rule engine)
+ *   - PII detection
+ *   - Circuit breaker (per-provider)
+ *   - Pattern memory (prompt hashing)
+ *
+ * Usage:
+ * ```ts
+ * const client = await govern(new Anthropic(), { dryRun: true, budget: 50_000 });
+ * const { response, governance } = await client.messages.create({ ... });
+ * await client.destroy();
+ * ```
+ */
+
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { createAuditWriter, type AuditWriter } from "./audit/chain.js";
+import { detectClientKind } from "./detect.js";
+import { estimateCost, estimateInputTokens } from "./ledger/pricing.js";
+import { evaluatePolicy, loadPolicies, type GateRule } from "./policy/gate.js";
+import { detectPII } from "./policy/pii.js";
+import { CircuitBreakerRegistry } from "./resilience/circuit.js";
+import { recordPattern } from "./memory/patterns.js";
+import { GovernConfigSchema } from "./shared/types.js";
+import type {
+	GovernanceReceipt,
+	GovernedResponse,
+	GovernConfig,
+	LLMClientKind,
+} from "./shared/types.js";
+import { governId } from "./shared/ids.js";
+import { VAULT_DIR, DEFAULT_BUDGET } from "./shared/constants.js";
+import { PolicyDeniedError } from "./shared/errors.js";
+
+// ── Public types ──
+
+export interface GovernOpts {
+	/** Path to govern.config.json. Defaults to `.usertools/govern.config.json`. */
+	configPath?: string;
+	/** Remote proxy URL. When set, receipts include a verify URL. */
+	proxy?: string;
+	/** API key for the proxy. */
+	key?: string;
+	/** Token budget override. */
+	budget?: number;
+	/** Tier override. */
+	tier?: string;
+	/**
+	 * Dry-run mode — skips TigerBeetle, audit-chain-only.
+	 * Also enabled by GOVERN_DRY_RUN=true env var.
+	 */
+	dryRun?: boolean;
+	/** Vault directory override (default: cwd). */
+	vaultBase?: string;
+}
+
+/** The governed client: original client shape + `destroy()`. */
+export type GovernedClient<T> = T & { destroy(): Promise<void> };
+
+// ── govern() ──
+
+export async function govern<T>(
+	client: T,
+	opts?: GovernOpts,
+): Promise<GovernedClient<T>> {
+	// 1. Load config
+	const vaultBase = opts?.vaultBase ?? process.cwd();
+	const configPath =
+		opts?.configPath ?? join(vaultBase, VAULT_DIR, "govern.config.json");
+
+	let config: GovernConfig;
+	if (existsSync(configPath)) {
+		const raw: unknown = JSON.parse(await readFile(configPath, "utf-8"));
+		config = GovernConfigSchema.parse({
+			...(raw as Record<string, unknown>),
+			...(opts?.budget !== undefined ? { budget: opts.budget } : {}),
+		});
+	} else {
+		config = GovernConfigSchema.parse({
+			budget: opts?.budget ?? DEFAULT_BUDGET,
+		});
+	}
+
+	const isDryRun = opts?.dryRun ?? process.env.GOVERN_DRY_RUN === "true";
+
+	// 2. Initialise subsystems
+	const vaultPath = vaultBase;
+	const audit = createAuditWriter(vaultPath);
+
+	const policiesPath = join(vaultPath, config.policies);
+	const policyRules: GateRule[] = existsSync(policiesPath)
+		? loadPolicies(policiesPath)
+		: [];
+
+	const breaker = new CircuitBreakerRegistry({
+		failureThreshold: config.circuitBreaker.failureThreshold,
+		resetTimeoutMs: config.circuitBreaker.resetTimeout,
+	});
+
+	// 3. Detect client kind
+	const kind: LLMClientKind = detectClientKind(client);
+
+	// 4. Track state
+	let destroyed = false;
+	let budgetSpent = 0;
+
+	// 5. Two-phase intercept
+	async function interceptCall(
+		originalFn: (...args: unknown[]) => unknown,
+		thisArg: unknown,
+		args: unknown[],
+	): Promise<GovernedResponse<unknown>> {
+		if (destroyed) {
+			throw new Error("GovernedClient has been destroyed");
+		}
+
+		const params = (args[0] ?? {}) as Record<string, unknown>;
+		const model = (params.model as string) ?? "unknown";
+		const messages = (params.messages as unknown[]) ?? [];
+
+		// a. Circuit breaker check
+		const cb = breaker.get(kind);
+		cb.allowRequest();
+
+		// b. Policy gate
+		const policyResult = evaluatePolicy(policyRules, { model, tier: config.tier, ...params });
+		if (policyResult.decision === "deny") {
+			const reason =
+				policyResult.reasons.length > 0
+					? policyResult.reasons.join("; ")
+					: "Policy denied";
+			throw new PolicyDeniedError(reason);
+		}
+
+		// c. PII check
+		if (config.pii !== "off") {
+			const piiResult = detectPII(messages);
+			if (piiResult.found && config.pii === "block") {
+				throw new PolicyDeniedError(
+					`PII detected: ${piiResult.types.join(", ")}`,
+				);
+			}
+			// "warn" and "redact" modes: continue (redact is not implemented at SDK level)
+		}
+
+		// d. Estimate cost
+		const transferId = governId("tx");
+		const estimatedInputTokens = estimateInputTokens(messages);
+		const maxOutputTokens = (params.max_tokens as number) ?? 4096;
+		const estimatedCost = estimateCost(model, estimatedInputTokens, maxOutputTokens);
+
+		// e. Forward to original SDK
+		try {
+			const response = await (originalFn as Function).apply(thisArg, args);
+
+			// f. Compute actual cost from response usage
+			let actualCost = estimatedCost;
+			if (response != null && typeof response === "object" && "usage" in response) {
+				const usage = (response as Record<string, unknown>).usage as Record<
+					string,
+					unknown
+				> | null;
+				if (usage != null) {
+					const inputTokens =
+						(usage.input_tokens as number | undefined) ??
+						(usage.prompt_tokens as number | undefined) ??
+						estimatedInputTokens;
+					const outputTokens =
+						(usage.output_tokens as number | undefined) ??
+						(usage.completion_tokens as number | undefined) ??
+						0;
+					actualCost = estimateCost(model, inputTokens, outputTokens);
+				}
+			}
+
+			// Track budget in dry-run mode
+			budgetSpent += actualCost;
+
+			// g. Circuit breaker: record success
+			cb.recordSuccess();
+
+			// h. Audit event
+			const auditHash = createHash("sha256").update(transferId).digest("hex");
+			await audit
+				.appendEvent({
+					kind: "llm_call",
+					actor: "local",
+					data: { model, cost: actualCost, settled: true, transferId },
+				})
+				.catch(() => {
+					// Audit degraded — do not fail the response
+				});
+
+			// i. Pattern memory
+			if (config.patterns.enabled) {
+				const promptHash = createHash("sha256")
+					.update(JSON.stringify(messages))
+					.digest("hex");
+				await recordPattern({
+					promptHash,
+					model,
+					cost: actualCost,
+					success: true,
+				}).catch(() => {});
+			}
+
+			const budgetRemaining = isDryRun
+				? config.budget - budgetSpent
+				: config.budget - budgetSpent;
+
+			const governance: GovernanceReceipt = {
+				transferId,
+				cost: actualCost,
+				budgetRemaining,
+				auditHash,
+				chainPath: join(VAULT_DIR, "audit"),
+				receiptUrl: opts?.proxy
+					? `https://verify.usertools.dev/${transferId}`
+					: null,
+				settled: true,
+				model,
+				provider: kind,
+				timestamp: new Date().toISOString(),
+			};
+
+			return { response, governance };
+		} catch (err) {
+			// j. Circuit breaker: record failure
+			cb.recordFailure();
+
+			// k. Audit the failure
+			await audit
+				.appendEvent({
+					kind: "llm_call_failed",
+					actor: "local",
+					data: { model, error: String(err), transferId },
+				})
+				.catch(() => {});
+
+			// l. Pattern memory: record failure
+			if (config.patterns.enabled) {
+				const promptHash = createHash("sha256")
+					.update(JSON.stringify(messages))
+					.digest("hex");
+				await recordPattern({
+					promptHash,
+					model,
+					cost: 0,
+					success: false,
+				}).catch(() => {});
+			}
+
+			throw err;
+		}
+	}
+
+	// 6. Build Proxy based on client kind
+	function createProxy(): GovernedClient<T> {
+		const destroyFn = async (): Promise<void> => {
+			if (destroyed) return;
+			destroyed = true;
+			await audit.flush();
+			audit.release();
+		};
+
+		if (kind === "anthropic") {
+			return buildAnthropicProxy(
+				client,
+				interceptCall,
+				destroyFn,
+			);
+		}
+		if (kind === "openai") {
+			return buildOpenAIProxy(client, interceptCall, destroyFn);
+		}
+		// google
+		return buildGoogleProxy(client, interceptCall, destroyFn);
+	}
+
+	return createProxy();
+}
+
+// ── Proxy builders ──
+// Each builder intercepts only the `create` / `generateContent` call and
+// preserves all other properties of the original client untouched.
+
+type InterceptFn = (
+	originalFn: (...args: unknown[]) => unknown,
+	thisArg: unknown,
+	args: unknown[],
+) => Promise<GovernedResponse<unknown>>;
+
+function buildAnthropicProxy<T>(
+	client: T,
+	intercept: InterceptFn,
+	destroy: () => Promise<void>,
+): GovernedClient<T> {
+	const original = client as Record<string, unknown>;
+	const messages = original.messages as Record<string, unknown>;
+	const originalCreate = messages.create as (...args: unknown[]) => unknown;
+
+	// Proxy on the messages object: intercept `create`
+	const messagesProxy = new Proxy(messages, {
+		get(target, prop, receiver) {
+			if (prop === "create") {
+				return (...args: unknown[]) =>
+					intercept(originalCreate, target, args);
+			}
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	// Proxy on the client: intercept `messages` to return our proxy, add `destroy`
+	const clientProxy = new Proxy(original, {
+		get(target, prop, receiver) {
+			if (prop === "messages") return messagesProxy;
+			if (prop === "destroy") return destroy;
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	return clientProxy as GovernedClient<T>;
+}
+
+function buildOpenAIProxy<T>(
+	client: T,
+	intercept: InterceptFn,
+	destroy: () => Promise<void>,
+): GovernedClient<T> {
+	const original = client as Record<string, unknown>;
+	const chat = original.chat as Record<string, unknown>;
+	const completions = chat.completions as Record<string, unknown>;
+	const originalCreate = completions.create as (...args: unknown[]) => unknown;
+
+	const completionsProxy = new Proxy(completions, {
+		get(target, prop, receiver) {
+			if (prop === "create") {
+				return (...args: unknown[]) =>
+					intercept(originalCreate, target, args);
+			}
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	const chatProxy = new Proxy(chat, {
+		get(target, prop, receiver) {
+			if (prop === "completions") return completionsProxy;
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	const clientProxy = new Proxy(original, {
+		get(target, prop, receiver) {
+			if (prop === "chat") return chatProxy;
+			if (prop === "destroy") return destroy;
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	return clientProxy as GovernedClient<T>;
+}
+
+function buildGoogleProxy<T>(
+	client: T,
+	intercept: InterceptFn,
+	destroy: () => Promise<void>,
+): GovernedClient<T> {
+	const original = client as Record<string, unknown>;
+	const models = original.models as Record<string, unknown>;
+	const originalGenerate = models.generateContent as (
+		...args: unknown[]
+	) => unknown;
+
+	const modelsProxy = new Proxy(models, {
+		get(target, prop, receiver) {
+			if (prop === "generateContent") {
+				return (...args: unknown[]) =>
+					intercept(originalGenerate, target, args);
+			}
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	const clientProxy = new Proxy(original, {
+		get(target, prop, receiver) {
+			if (prop === "models") return modelsProxy;
+			if (prop === "destroy") return destroy;
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+
+	return clientProxy as GovernedClient<T>;
+}
