@@ -45,6 +45,32 @@ describe("getModelRates", () => {
 		const rates = getModelRates("totally-unknown-model-xyz");
 		expect(rates).toEqual(FALLBACK_RATE);
 	});
+
+	it("returns exact match for every model in the table", () => {
+		for (const [model, expected] of Object.entries(PRICING_TABLE)) {
+			const rates = getModelRates(model);
+			expect(rates).toBe(expected);
+		}
+	});
+
+	it("prefix matches longest key first to avoid partial collisions", () => {
+		// "gpt-4o-mini" is a separate key from "gpt-4o"
+		// "gpt-4o-mini-2025" should match "gpt-4o-mini", not "gpt-4o"
+		const rates = getModelRates("gpt-4o-mini-2025");
+		expect(rates.inputPer1k).toBe(1.5); // gpt-4o-mini rate
+		expect(rates.outputPer1k).toBe(6);
+	});
+
+	it("prefix matches gpt-4o versioned string to gpt-4o (not gpt-4o-mini)", () => {
+		const rates = getModelRates("gpt-4o-2025-01-01");
+		expect(rates.inputPer1k).toBe(25); // gpt-4o rate
+		expect(rates.outputPer1k).toBe(100);
+	});
+
+	it("handles empty string gracefully (falls back)", () => {
+		const rates = getModelRates("");
+		expect(rates).toEqual(FALLBACK_RATE);
+	});
 });
 
 describe("estimateCost", () => {
@@ -81,6 +107,30 @@ describe("estimateCost", () => {
 	it("returns integer (ceiling)", () => {
 		const cost = estimateCost("claude-sonnet-4-6", 100, 100);
 		expect(Number.isInteger(cost)).toBe(true);
+	});
+
+	it("returns 1 for zero input and zero output tokens", () => {
+		const cost = estimateCost("claude-sonnet-4-6", 0, 0);
+		expect(cost).toBe(1); // Math.max(1, ...)
+	});
+
+	it("handles output-only cost correctly", () => {
+		// 0 input + 1000 output * 150/1k = 150
+		const cost = estimateCost("claude-sonnet-4-6", 0, 1000);
+		expect(cost).toBe(150);
+	});
+
+	it("handles input-only cost correctly", () => {
+		// 1000 input * 30/1k + 0 output = 30
+		const cost = estimateCost("claude-sonnet-4-6", 1000, 0);
+		expect(cost).toBe(30);
+	});
+
+	it("returns 1 for fractional cost that rounds down to zero", () => {
+		// 1 input * 1.5/1k = 0.0015, 0 output → ceil(0.0015) = 1
+		// But Math.max(1, 1) = 1
+		const cost = estimateCost("gpt-4o-mini", 1, 0);
+		expect(cost).toBe(1);
 	});
 });
 
@@ -144,5 +194,180 @@ describe("estimateInputTokens", () => {
 		// Raw tokens ≈ (4000 + 16) / 4 = 1004 → with 1.5x ≈ 1506
 		expect(tokens).toBeGreaterThan(1000);
 		expect(tokens).toBeLessThan(2000);
+	});
+
+	it("returns 1 for non-array input", () => {
+		// The function checks Array.isArray first
+		const tokens = estimateInputTokens("not an array" as any);
+		expect(tokens).toBe(1);
+	});
+
+	it("skips null/non-object messages", () => {
+		const messages = [null, undefined, 42, "string", { role: "user", content: "hi" }];
+		const tokens = estimateInputTokens(messages);
+		// Only the last message contributes: textChars = 2 + 16 = 18
+		// ceil(18/4) = 5 → ceil(5 * 1.5) = 8
+		expect(tokens).toBe(8);
+	});
+
+	it("handles non-text content blocks (image_url, etc.) via estimateBlockTokens", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{ type: "image_url", image_url: { url: "https://example.com/img.png" } },
+				],
+			},
+		];
+		// This block is not type "text", so it goes to estimateBlockTokens
+		// estimateBlockTokens: no "text" or "content" string → chars=0 → JSON.stringify fallback
+		// 16 (overhead) textChars + blockTokens from JSON.stringify
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBeGreaterThan(1);
+	});
+
+	it("handles content blocks with 'text' property (non-text type)", () => {
+		// A block that has type != "text" but has a "text" property
+		// This tests estimateBlockTokens's text extraction
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", text: "The answer is 42" },
+				],
+			},
+		];
+		// Goes to estimateBlockTokens since type != "text"
+		// estimateBlockTokens: typeof block["text"] === "string" → chars += 16
+		// Math.ceil(16 / 4) = 4 blockTokens
+		// textChars = 16 (overhead) → ceil(16/4) = 4 textTokens
+		// raw = 4 + 4 = 8 → ceil(8 * 1.5) = 12
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBe(12);
+	});
+
+	it("handles content blocks with 'content' string property", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", content: "Result data here" },
+				],
+			},
+		];
+		// estimateBlockTokens: typeof block["content"] === "string" → chars += 16
+		// Math.ceil(16 / 4) = 4 blockTokens
+		// textChars = 16 (overhead) → ceil(16/4) = 4 textTokens
+		// raw = 4 + 4 = 8 → ceil(8 * 1.5) = 12
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBe(12);
+	});
+
+	it("handles content blocks with nested array content (tool_result payloads)", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						content: [
+							"string item",
+							{ type: "text", text: "nested text" },
+						],
+					},
+				],
+			},
+		];
+		// estimateBlockTokens:
+		//   content is Array → iterate:
+		//     "string item" (11 chars) → chars += 11
+		//     { type: "text", text: "nested text" } → object → JSON.stringify → chars += length
+		//   Total chars > 0 so no fallback
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBeGreaterThan(1);
+	});
+
+	it("handles content blocks with nested array containing null", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						content: [null, undefined, "valid"],
+					},
+				],
+			},
+		];
+		// null/undefined items are skipped (typeof null !== "string", null == null → skip)
+		// "valid" → chars += 5
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBeGreaterThan(1);
+	});
+
+	it("handles content blocks with both text and content properties", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "custom",
+						text: "some text",
+						content: "some content",
+					},
+				],
+			},
+		];
+		// estimateBlockTokens: text (9 chars) + content (12 chars) = 21
+		// Math.ceil(21 / 4) = 6 blockTokens
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBeGreaterThan(1);
+	});
+
+	it("skips null/non-object blocks in array content", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [null, undefined, 42],
+			},
+		];
+		// All blocks are skipped (null, undefined, number)
+		// textChars = 16 (overhead only) → ceil(16/4) = 4 → ceil(4*1.5) = 6
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBe(6);
+	});
+
+	it("handles message with no content property", () => {
+		const messages = [
+			{ role: "user" },
+		];
+		// content is undefined → neither string nor Array
+		// textChars = 16 (overhead) → ceil(16/4) = 4 → ceil(4*1.5) = 6
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBe(6);
+	});
+
+	it("handles empty array content", () => {
+		const messages = [
+			{ role: "user", content: [] },
+		];
+		// Array but no blocks → textChars = 16 (overhead) → 6
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBe(6);
+	});
+
+	it("handles block with zero-length text (falls back to JSON.stringify)", () => {
+		const messages = [
+			{
+				role: "user",
+				content: [
+					{ type: "empty_block" },
+				],
+			},
+		];
+		// estimateBlockTokens: no "text", no "content" → chars = 0
+		// fallback: JSON.stringify({ type: "empty_block" }) → some chars
+		const tokens = estimateInputTokens(messages);
+		expect(tokens).toBeGreaterThan(1);
 	});
 });

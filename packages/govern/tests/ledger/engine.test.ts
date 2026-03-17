@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+// Hoist mock variables so they're available inside vi.mock factories
+const { mockExistsSync, mockMkdirSync, mockWriteFileSync } = vi.hoisted(() => {
+	return {
+		mockExistsSync: vi.fn(() => true),
+		mockMkdirSync: vi.fn(),
+		mockWriteFileSync: vi.fn(),
+	};
+});
+
 // Mock tigerbeetle-node (needed because engine.ts imports CreateTransferError)
 vi.mock("tigerbeetle-node", () => ({
 	createClient: vi.fn(),
@@ -19,9 +28,9 @@ vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
 		...actual,
-		existsSync: vi.fn(() => true),
-		mkdirSync: vi.fn(),
-		writeFileSync: vi.fn(),
+		existsSync: mockExistsSync,
+		mkdirSync: mockMkdirSync,
+		writeFileSync: mockWriteFileSync,
 	};
 });
 
@@ -64,6 +73,7 @@ describe("GovernEngine", () => {
 
 	beforeEach(() => {
 		vi.clearAllMocks();
+		mockExistsSync.mockReturnValue(true);
 		mockTB = createMockTBClient();
 		engine = new GovernEngine({
 			tbClient: mockTB as any,
@@ -140,6 +150,38 @@ describe("GovernEngine", () => {
 			).rejects.toThrow(InsufficientBalanceError);
 		});
 
+		it("catches TB overflows_debits error and wraps it", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+
+			const tbErr = new Error("Pending transfer failed: overflows_debits");
+			Object.assign(tbErr, { name: "TBTransferError", code: 30 });
+			mockTB.createPendingTransfer.mockRejectedValueOnce(tbErr);
+
+			await expect(
+				engine.spendPending({ userId: "user_1", action: DEFAULT_ACTION }),
+			).rejects.toThrow(InsufficientBalanceError);
+		});
+
+		it("catches TB overflows_debits_pending error and wraps it", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+
+			const tbErr = new Error("Pending transfer failed: overflows_debits_pending");
+			Object.assign(tbErr, { name: "TBTransferError", code: 31 });
+			mockTB.createPendingTransfer.mockRejectedValueOnce(tbErr);
+
+			await expect(
+				engine.spendPending({ userId: "user_1", action: DEFAULT_ACTION }),
+			).rejects.toThrow(InsufficientBalanceError);
+		});
+
 		it("includes agentRef as userData32 when provided", async () => {
 			mockTB.lookupBalance.mockResolvedValueOnce({
 				available: 100_000,
@@ -159,6 +201,23 @@ describe("GovernEngine", () => {
 			expect(typeof call.userData32).toBe("number");
 		});
 
+		it("does not include userData32 when no agentRef", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+			mockTB.createPendingTransfer.mockResolvedValueOnce(42n);
+
+			await engine.spendPending({
+				userId: "user_1",
+				action: DEFAULT_ACTION,
+			});
+
+			const call = mockTB.createPendingTransfer.mock.calls[0]![0];
+			expect(call.userData32).toBeUndefined();
+		});
+
 		it("propagates non-balance errors from TB", async () => {
 			mockTB.lookupBalance.mockResolvedValueOnce({
 				available: 100_000,
@@ -172,6 +231,80 @@ describe("GovernEngine", () => {
 			await expect(
 				engine.spendPending({ userId: "user_1", action: DEFAULT_ACTION }),
 			).rejects.toThrow("Connection refused");
+		});
+
+		it("does not treat non-object errors as balance errors", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+
+			mockTB.createPendingTransfer.mockRejectedValueOnce(null);
+
+			await expect(
+				engine.spendPending({ userId: "user_1", action: DEFAULT_ACTION }),
+			).rejects.toBeNull();
+		});
+
+		it("does not treat errors without code property as balance errors", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+
+			const err = new Error("some error");
+			// Has name but no code
+			Object.assign(err, { name: "TBTransferError" });
+			mockTB.createPendingTransfer.mockRejectedValueOnce(err);
+
+			await expect(
+				engine.spendPending({ userId: "user_1", action: DEFAULT_ACTION }),
+			).rejects.toThrow("some error");
+		});
+
+		it("does not treat errors with wrong name as balance errors", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+
+			const err = new Error("some error");
+			Object.assign(err, { name: "SomeOtherError", code: 22 });
+			mockTB.createPendingTransfer.mockRejectedValueOnce(err);
+
+			await expect(
+				engine.spendPending({ userId: "user_1", action: DEFAULT_ACTION }),
+			).rejects.toThrow("some error");
+		});
+
+		it("returns correct result shape", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+			mockTB.createPendingTransfer.mockResolvedValueOnce(42n);
+
+			const result = await engine.spendPending({
+				userId: "user_1",
+				action: DEFAULT_ACTION,
+			});
+
+			expect(result).toEqual(
+				expect.objectContaining({
+					transferId: "42",
+					debitAccountId: expect.any(String),
+					creditAccountId: "1",
+					amount: 105,
+					pending: true,
+					timestamp: expect.any(String),
+				}),
+			);
+			// Verify timestamp is a valid ISO string
+			expect(() => new Date(result.timestamp)).not.toThrow();
 		});
 	});
 
@@ -199,7 +332,6 @@ describe("GovernEngine", () => {
 		});
 
 		it("writes to DLQ when both post and void fail", async () => {
-			const { writeFileSync } = await import("node:fs");
 			mockTB.postTransfer.mockRejectedValueOnce(new Error("post failed"));
 			mockTB.voidTransfer.mockRejectedValueOnce(new Error("void failed"));
 
@@ -207,7 +339,71 @@ describe("GovernEngine", () => {
 				"Spend settlement ambiguous",
 			);
 
-			expect(writeFileSync).toHaveBeenCalled();
+			expect(mockWriteFileSync).toHaveBeenCalled();
+			// Verify the DLQ entry contains proper data
+			const writtenData = mockWriteFileSync.mock.calls[0]![1] as string;
+			const dlqEntry = JSON.parse(writtenData.trim());
+			expect(dlqEntry.source).toBe("engine.postPendingSpend.ambiguous");
+			expect(dlqEntry.transferId).toBe("42");
+		});
+
+		it("creates DLQ directory if it does not exist", async () => {
+			mockExistsSync.mockReturnValue(false);
+			mockTB.postTransfer.mockRejectedValueOnce(new Error("post failed"));
+			mockTB.voidTransfer.mockRejectedValueOnce(new Error("void failed"));
+
+			await expect(engine.postPendingSpend("42")).rejects.toThrow(
+				"Spend settlement ambiguous",
+			);
+
+			expect(mockMkdirSync).toHaveBeenCalledWith("/tmp/test-dlq", { recursive: true });
+		});
+
+		it("does not throw when DLQ write itself fails (line 63/69)", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			mockTB.postTransfer.mockRejectedValueOnce(new Error("post failed"));
+			mockTB.voidTransfer.mockRejectedValueOnce(new Error("void failed"));
+
+			// Make the DLQ write throw
+			mockWriteFileSync.mockImplementationOnce(() => {
+				throw new Error("disk full");
+			});
+
+			// The ambiguous error should still be thrown even when DLQ fails
+			await expect(engine.postPendingSpend("42")).rejects.toThrow(
+				"Spend settlement ambiguous",
+			);
+
+			// The DLQ failure should be logged to console.error
+			expect(errorSpy).toHaveBeenCalledWith(
+				"[govern] Failed to write dead letter:",
+				expect.any(Error),
+			);
+
+			errorSpy.mockRestore();
+		});
+
+		it("does not throw when mkdirSync fails in DLQ (line 63/69)", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			mockExistsSync.mockReturnValue(false);
+			mockTB.postTransfer.mockRejectedValueOnce(new Error("post failed"));
+			mockTB.voidTransfer.mockRejectedValueOnce(new Error("void failed"));
+
+			// Make mkdirSync throw
+			mockMkdirSync.mockImplementationOnce(() => {
+				throw new Error("permission denied");
+			});
+
+			await expect(engine.postPendingSpend("42")).rejects.toThrow(
+				"Spend settlement ambiguous",
+			);
+
+			expect(errorSpy).toHaveBeenCalledWith(
+				"[govern] Failed to write dead letter:",
+				expect.any(Error),
+			);
+
+			errorSpy.mockRestore();
 		});
 	});
 
@@ -235,6 +431,19 @@ describe("GovernEngine", () => {
 			expect(bal.available).toBe(5000);
 			expect(bal.pending).toBe(200);
 			expect(bal.total).toBe(5200);
+		});
+
+		it("delegates to tb.getAccountId then lookupBalance", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 1000,
+				pending: 0,
+				total: 1000,
+			});
+			await engine.balance("user_1");
+			expect(mockTB.getAccountId).toHaveBeenCalledWith("user_1");
+			expect(mockTB.lookupBalance).toHaveBeenCalledWith(
+				mockTB.getAccountId("user_1"),
+			);
 		});
 	});
 
@@ -279,6 +488,26 @@ describe("GovernEngine", () => {
 		});
 	});
 
+	describe("configurable DLQ path", () => {
+		it("uses default DLQ path when not specified", async () => {
+			const defaultEngine = new GovernEngine({
+				tbClient: mockTB as any,
+			});
+
+			mockTB.postTransfer.mockRejectedValueOnce(new Error("post failed"));
+			mockTB.voidTransfer.mockRejectedValueOnce(new Error("void failed"));
+
+			await expect(defaultEngine.postPendingSpend("42")).rejects.toThrow(
+				"Spend settlement ambiguous",
+			);
+
+			// The default path should be .usertools/dlq
+			const filePath = mockWriteFileSync.mock.calls[0]![0] as string;
+			expect(filePath).toContain("dlq");
+			expect(filePath).toContain("dead-letter.jsonl");
+		});
+	});
+
 	describe("two-phase lifecycle", () => {
 		it("spendPending -> postPendingSpend (success path)", async () => {
 			mockTB.lookupBalance.mockResolvedValueOnce({
@@ -316,6 +545,26 @@ describe("GovernEngine", () => {
 
 			await engine.voidPendingSpend(result.transferId);
 			expect(mockTB.voidTransfer).toHaveBeenCalledWith(42n);
+		});
+
+		it("full hold-settle-with-actual-amount flow", async () => {
+			mockTB.lookupBalance.mockResolvedValueOnce({
+				available: 100_000,
+				pending: 0,
+				total: 100_000,
+			});
+			mockTB.createPendingTransfer.mockResolvedValueOnce(42n);
+			mockTB.postTransfer.mockResolvedValueOnce(100n);
+
+			const result = await engine.spendPending({
+				userId: "user_1",
+				action: DEFAULT_ACTION,
+			});
+			expect(result.amount).toBe(105); // estimated cost
+
+			// Actual cost was less
+			await engine.postPendingSpend(result.transferId, 80);
+			expect(mockTB.postTransfer).toHaveBeenCalledWith(42n, 80);
 		});
 	});
 });
